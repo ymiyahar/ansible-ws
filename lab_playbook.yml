@@ -1,0 +1,143 @@
+---
+- hosts: web
+  vars:
+    supported_os_distribution: "RedHat"
+    supported_major_version: "7"
+    users:
+      - { name: 'web-admin', groups: 'wheel', shell: '/bin/bash' }
+    packages:
+      - httpd
+      - firewalld
+    httpd_port: 8080
+    sshd_port: 22
+
+  tasks:
+  - name: determine supported Base OS and distribution version
+    fail:
+      msg: "{{ ansible_distribution }} {{ ansible_distribution_version }} is not supported"
+    when:
+          not (ansible_distribution == supported_os_distribution and
+               ansible_distribution_major_version == supported_major_version)
+
+  - name: enable Security-Enhanced Linux (SELinux)
+    selinux:
+      policy: targeted
+      state: enforcing
+
+  - name: show kernel version
+    debug:
+      msg: "{{ ansible_kernel }}"
+
+  - name: show default IPv4 address
+    debug:
+      msg: "{{ ansible_default_ipv4.address }}"
+
+  - name: show IPv4 address on eth0
+    debug:
+      msg: "{{ hostvars[inventory_hostname].ansible_eth0.ipv4.address }}"
+
+  - name: add users
+    user:
+      name: "{{ item.name }}"
+      groups: "{{ item.groups }}"
+      shell: "{{ item.shell  }}"
+      createhome: no
+      state: present
+    with_items: "{{ users }}"
+
+  - name: disable root login
+    lineinfile:
+      dest: /etc/ssh/sshd_config
+      line: "PermitRootLogin no"
+    notify:
+      - restart sshd
+      - wait for sshd up
+
+  - name: install packages
+    yum:
+      name: "{{ item }}"
+      state: installed
+    with_items: "{{ packages }}"
+
+  - name: start and enable services at boot
+    systemd:
+      name: "{{ item }}"
+      state: started
+      enabled: yes
+    with_items: "{{ packages }}"
+
+  - name: configure httpd.conf
+    lineinfile:
+      dest: /etc/httpd/conf/httpd.conf
+      regexp: '^Listen '
+      line: "Listen {{ httpd_port }}"
+    notify:
+      - restart httpd
+      - wait for httpd up
+
+  - name: set html file
+    template:
+      src: index.html.j2
+      dest: /var/www/html/index.html
+
+  - name: allow httpd to listen on tcp port
+    seport:
+      ports: "{{ httpd_port }}"
+      proto: tcp
+      setype: http_port_t
+      state: present
+
+  - name: configure firewall rules {{ httpd_port }}
+    firewalld:
+      port: "{{ httpd_port }}/tcp"
+      permanent: yes
+      state: enabled
+      immediate: yes
+
+  - block:
+    - name: copy script
+      copy:
+        src: date.sh
+        dest: /usr/local/bin/date.sh
+        mode: 0755
+
+    always:
+    - name: run script
+      shell: /usr/local/bin/date.sh > /tmp/date.log
+
+    - name: fetch file
+      fetch:
+        src: /tmp/date.log
+        dest: /tmp/
+
+  - name: register crontab entry
+    cron:
+      name: "run and output date"
+      job: "/usr/local/bin/date.sh >> /tmp/date.log"
+      user: root
+      minute: 0
+      hour: 1
+      backup: yes
+
+  handlers:
+  - name: restart httpd
+    systemd:
+      name: httpd
+      state: restarted
+
+  - name: wait for httpd up
+    wait_for:
+      port: "{{ httpd_port }}"
+      state: started
+      delay: 30
+
+  - name: restart sshd
+    systemd:
+      name: sshd
+      state: restarted
+
+  - name: wait for sshd up
+    wait_for:
+      port: "{{ sshd_port }}"
+      state: started
+      delay: 30
